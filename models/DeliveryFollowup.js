@@ -4,12 +4,12 @@ const { Schema, model } = require("mongoose");
 const deliveryFollowupSchema = new Schema({
     _id: { type: String },
     
-    saleId: { type: String, ref: 'Sale', required: true, unique: true },
+    saleId: { type: String, ref: 'sale', required: true, unique: true },
     
     deliveryDateTime: { type: Date, required: true },
     
     receivedQuantities: [{
-        productId: { type: String, ref: 'Product' },
+        productId: { type: String, ref: 'product' },
         quantityReceived: { type: Number, required: true }
     }],
     
@@ -23,7 +23,9 @@ const deliveryFollowupSchema = new Schema({
     
     // --- OFFLINE SYNC REQUIRED FIELDS ---
     isDeleted: { type: Boolean, default: false },
-    userId: { type: Schema.Types.ObjectId, ref: 'User' }
+    userId: { type: Schema.Types.ObjectId, ref: 'user' },
+    companyId: { type: Schema.Types.ObjectId, ref: 'user', required: true }
+    
 }, { 
     timestamps: true 
 });

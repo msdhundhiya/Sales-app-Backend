@@ -1,85 +1,34 @@
 const express = require("express");
 const userRoute = express.Router();
-const zod = require('zod');
 const { userModel } = require('../models/User');
-const {customerModel} = require('../models/Customer');
-const {productModel} = require('../models/Product');
-const {saleModel} = require('../models/Sale');
+const { customerModel } = require('../models/Customer');
+const { productModel } = require('../models/Product');
+const { saleModel } = require('../models/Sale');
 const Visit = require('../models/Visit');
 const DeliveryFollowup = require('../models/DeliveryFollowup');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
 const { middleware } = require('../middleware/middleware');
 const middle = middleware(process.env.JWT_SEC_USER);
 require('dotenv').config();
 
-userRoute.post("/signup", async function (req, res) {
-    const requirebody = zod.object({
-        email: zod.email(),
-        password: zod.string().min(8).max(50).regex(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]+$/),
-    });
-    const parseddata = requirebody.safeParse(req.body);
-    if (!parseddata.success) {
-        return res.json({
-            message: "incorrect data format",
-            error: parseddata.error
-        })
-    }
-    const { email, password } = req.body;
-    const hashedpass = await bcrypt.hash(password, 6);
-    let errorthrown = false;
-    try {
-        await userModel.create({
-            email: email,
-            password: hashedpass,
-        });
-    } catch (error) {
-        errorthrown = true;
-        return res.json({
-            message: "User already exists!",
-        });
-
-    }
-    if (!errorthrown) {
-        res.json({
-            message: "you are signed up"
-        });
-    }
-});
-
-userRoute.post("/login", async function (req, res) {
-    const { email, password } = req.body;
-    const user = await userModel.findOne({
-        email
-    });
-
-    // console.log(user);
-    const passwordmatch = await bcrypt.compare(password, user.password);
-    if (passwordmatch) {
-        const token = jwt.sign({
-            id: user._id
-        }, process.env.JWT_SEC_USER);
-        res.json({
-            token
-        });
-    } else {
-        res.status(403).json({
-            message: "invalid credentials"
-        });
-    }
-});
-const processBulkUpsert = async (Model, items, userId) => {
+const processBulkUpsert = async (Model, items, currentUserId, companyId, userRole) => {
     if (!items || items.length === 0) return;
 
     const bulkOps = items.map((item) => {
-        // Extract the 'id' (from sqflite) and the rest of the fields
         const { id, ...data } = item;
+
+        const updateFields = { ...data };
+        // If non-admin or userId not provided, bind to authenticated user
+        if (userRole !== 'admin' || !updateFields.userId) {
+            updateFields.userId = currentUserId;
+        }
+        if (companyId) {
+            updateFields.companyId = companyId;
+        }
 
         return {
             updateOne: {
-                filter: { _id: id, userId: userId },
-                update: { $set: { ...data } },
-
+                filter: { _id: id },
+                update: { $set: updateFields },
                 upsert: true
             }
         };
@@ -90,40 +39,65 @@ const processBulkUpsert = async (Model, items, userId) => {
 
 userRoute.post('/sync', middle, async (req, res) => {
     try {
-        const userId = req.userId;
-
-        // Step 1: Parse the incoming payload
-        const { lastSyncTimestamp, changes } = req.body;
-        const { customers, products, sales, visits, deliveryFollowups } = changes;
-
-        // Step 2: Process the Client's Changes (Upserts)
-        await Promise.all([
-            processBulkUpsert(customerModel, customers, userId),
-            processBulkUpsert(productModel, products, userId)
-        ]);
-
-        await Promise.all([
-            processBulkUpsert(saleModel, sales, userId),
-            processBulkUpsert(Visit, visits, userId)
-        ]);
-
-        await processBulkUpsert(DeliveryFollowup, deliveryFollowups, userId);
-
-        // Step 3: Fetch the Server's Changes (Delta)
+        const { lastSyncTimestamp, changes = {} } = req.body;
+        const { customers = [], products = [], sales = [], visits = [], deliveryFollowups = [] } = changes;
         const syncDate = new Date(lastSyncTimestamp || 0);
 
+        // Retrieve fresh user details from DB to guarantee companyId & role
+        const authUser = await userModel.findById(req.user.id);
+        const currentUserId = authUser ? authUser._id : req.user.id;
+        const companyId = authUser?.companyId || req.user.companyId;
+        const userRole = authUser?.role || req.user.role;
+        const isAdmin = (userRole === 'admin');
+
+        // Step 1: Bulk Upsert Client's Changes
+        await Promise.all([
+            processBulkUpsert(customerModel, customers, currentUserId, companyId, userRole),
+            processBulkUpsert(productModel, products, currentUserId, companyId, userRole)
+        ]);
+
+        await Promise.all([
+            processBulkUpsert(saleModel, sales, currentUserId, companyId, userRole),
+            processBulkUpsert(Visit, visits, currentUserId, companyId, userRole)
+        ]);
+
+        await processBulkUpsert(DeliveryFollowup, deliveryFollowups, currentUserId, companyId, userRole);
+
+        // Step 2: Build Scoped Query Filters
+        // Base filter for company-wide entities (customers, products)
+        let companyBaseFilter = { updatedAt: { $gt: syncDate } };
+        if (companyId) {
+            companyBaseFilter.$or = [
+                { companyId: companyId },
+                { companyId: { $exists: false } },
+                { companyId: null }
+            ];
+        }
+
+        // Activity filter for transactions (sales, visits, delivery followups)
+        let activityFilter = { ...companyBaseFilter };
+        if (userRole === 'asm') {
+            const team = await userModel.find({ managerId: currentUserId }).select('_id');
+            const teamIds = team.map(member => member._id);
+            const allowedUserIds = [currentUserId, ...teamIds];
+            activityFilter.userId = { $in: allowedUserIds };
+        } else if (userRole === 'salesman') {
+            activityFilter.userId = currentUserId;
+        }
+
+        // Step 3: Fetch Server's Changes (Delta)
         const serverChanges = {
-            customers: await customerModel.find({ userId, updatedAt: { $gt: syncDate } }),
-            products: await productModel.find({ userId, updatedAt: { $gt: syncDate } }),
-            sales: await saleModel.find({ userId, updatedAt: { $gt: syncDate } }),
-            visits: await Visit.find({ userId, updatedAt: { $gt: syncDate } }),
-            deliveryFollowups: await DeliveryFollowup.find({ userId, updatedAt: { $gt: syncDate } })
+            customers: await customerModel.find(companyBaseFilter),
+            products: await productModel.find(companyBaseFilter),
+            sales: await saleModel.find(activityFilter),
+            visits: await Visit.find(activityFilter),
+            deliveryFollowups: await DeliveryFollowup.find(activityFilter)
         };
 
         // Step 4: Send Response
         res.status(200).json({
             success: true,
-            serverTimestamp: Date.now(), 
+            serverTimestamp: Date.now(),
             serverChanges
         });
 

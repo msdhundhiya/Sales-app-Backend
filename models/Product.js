@@ -7,7 +7,9 @@ const productSchema = new Schema({
     mrp: Number,
     sellingPrice: Number,
     isDeleted: { type: Boolean, default: false },
-    userId: { type: Schema.Types.ObjectId, ref: 'user' }
+    userId: { type: Schema.Types.ObjectId, ref: 'user' },
+    companyId: { type: Schema.Types.ObjectId, ref: 'user', required: true }
+
 }, { timestamps: true });
 
 
